@@ -1,0 +1,70 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# id-token: write lets the job ask GitHub for an OIDC token.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet publish src/SecretsDemo -c Release -o publish
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: publish
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app
+          path: publish
+
+      # Educational: show the claims inside the token GitHub issues to this job.
+      # Azure checks iss/sub/aud against the federated credential. Only the claims
+      # are printed, never the token itself.
+      - name: Inspect GitHub OIDC token
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('api://AzureADTokenExchange');
+            const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+            const { iss, sub, aud, repository, ref, workflow, exp } = claims;
+            console.log(JSON.stringify({ iss, sub, aud, repository, ref, workflow,
+              expires: new Date(exp * 1000).toISOString() }, null, 2));
+
+      # Exchanges the GitHub token for an Azure access token. No client secret involved.
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Proves the pipeline identity can read Key Vault. Use this pattern when a
+      # build/deploy step itself needs a secret (e.g. a DB migration).
+      - name: Read secret from Key Vault
+        run: |
+          value=$(az keyvault secret show --vault-name "${{ vars.AZURE_KEYVAULT_NAME }}" \
+                    --name DemoSecret --query value -o tsv)
+          echo "::add-mask::$value"
+          echo "Got DemoSecret from Key Vault (${#value} chars): $value"
+
+      - name: Deploy to App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          package: publish
