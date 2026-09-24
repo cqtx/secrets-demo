@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "/home/cfq/Dev/dotnet/secrets-evolution",
+      "/home/cfq/Syncthing/meteor_mint_home/Dev/dotnet/secrets-evolution"
+    ]
+  }
+}
