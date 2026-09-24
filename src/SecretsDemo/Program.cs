@@ -20,22 +20,44 @@ var app = builder.Build();
 app.MapGet("/", (IConfiguration config) =>
 {
     var secret = config["DemoSecret"];
-    var status = string.IsNullOrWhiteSpace(vaultUri)
-        ? "KeyVault:Uri is not configured."
-        : secret is null
-            ? $"Connected to {vaultUri}, but no secret named DemoSecret was found."
-            : $"Read DemoSecret from {vaultUri}";
-
-    var html = $"""
-        <!doctype html>
-        <title>Secrets Demo</title>
-        <body style="font-family:system-ui;max-width:40rem;margin:3rem auto;padding:0 1rem">
-          <h1>Key Vault secrets demo</h1>
-          <p>{WebUtility.HtmlEncode(status)}</p>
-          <p>DemoSecret = <code>{WebUtility.HtmlEncode(secret ?? "(none)")}</code></p>
-        </body>
-        """;
+    var status = DescribeStatus(vaultUri, secret);
+    var html = RenderPage(status, secret);
     return Results.Content(html, "text/html");
 });
 
 app.Run();
+
+// Turns the vault URI + whatever we found into a plain-English sentence, so
+// someone loading the page for the first time can tell what's actually wired up.
+static string DescribeStatus(string? vaultUri, string? secret)
+{
+    if (string.IsNullOrWhiteSpace(vaultUri))
+    {
+        return "KeyVault:Uri is not configured.";
+    }
+
+    if (secret is null)
+    {
+        return $"Connected to {vaultUri}, but no secret named DemoSecret was found.";
+    }
+
+    return $"Read DemoSecret from {vaultUri}";
+}
+
+// Builds the page shown at "/". Both values are HTML-encoded because a Key Vault
+// secret is arbitrary text and could otherwise break the markup.
+static string RenderPage(string status, string? secret)
+{
+    var encodedStatus = WebUtility.HtmlEncode(status);
+    var encodedSecret = WebUtility.HtmlEncode(secret ?? "(none)");
+
+    return $"""
+        <!doctype html>
+        <title>Secrets Demo</title>
+        <body style="font-family:system-ui;max-width:40rem;margin:3rem auto;padding:0 1rem">
+          <h1>Key Vault secrets demo</h1>
+          <p>{encodedStatus}</p>
+          <p>DemoSecret = <code>{encodedSecret}</code></p>
+        </body>
+        """;
+}

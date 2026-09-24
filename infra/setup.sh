@@ -4,6 +4,13 @@
 # immutable owner/repo IDs for the OIDC trust). Edit the variables below first.
 # Safe to re-run: every step checks whether its resource already exists
 # before creating it, so a failed run can just be re-run from the top.
+#
+# This assumes the app itself will be deployed to Azure App Service. If it's
+# actually going to run on-prem (or on any non-Azure host), skip the whole
+# "App Service" section below -- it's marked. You'd still want the Key Vault
+# and, usually, the GitHub identity; the on-prem app just needs its own way
+# to authenticate to the vault instead of a managed identity. See the
+# README's "Apps that aren't hosted in Azure at all" section for the options.
 set -euo pipefail
 
 # ---- edit these ------------------------------------------------------------
@@ -14,17 +21,21 @@ PLAN_NAME="plan-secretsdemo"
 ENTRA_APP_NAME="github-oidc-secretsdemo"
 # ---------------------------------------------------------------------------
 
+# Goal: gather identifiers we'll need throughout the script -- whose Azure
+# account this is, and which tenant/subscription it's in.
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 TENANT_ID=$(az account show --query tenantId -o tsv)
 ME=$(az ad signed-in-user show --query id -o tsv)
 
-# Derived once from the subscription id, so it's stable across re-runs but
-# still globally unique (Key Vault and Web App names must be globally unique).
+# Goal: pick names that are globally unique (required for Key Vault and Web
+# App) but stay the same on every re-run, instead of a new random name each
+# time -- derived once from the subscription id.
 SUFFIX=$(echo -n "$SUBSCRIPTION_ID" | tr -d '-' | cut -c1-8)
 KV_NAME="kv-secretsdemo-$SUFFIX"       # 3-24 chars, globally unique
-WEBAPP_NAME="app-secretsdemo-$SUFFIX"  # globally unique
+WEBAPP_NAME="app-secretsdemo-$SUFFIX"  # App Service only -- drop this if deploying elsewhere
 
-# Creates a role assignment only if an identical one doesn't already exist.
+# Goal: a reusable helper so granting a role is safe to run more than once --
+# creates the role assignment only if an identical one doesn't already exist.
 ensure_role_assignment() {
   local assignee_id="$1" principal_type="$2" role="$3" scope="$4"
   local existing
@@ -38,9 +49,13 @@ ensure_role_assignment() {
   fi
 }
 
+# Goal: create a container to hold every resource this script makes, so they
+# can all be deleted together later with a single `az group delete`.
 echo "==> Resource group"
 az group create -n "$RG" -l "$LOCATION" -o none
 
+# Goal: stand up the vault that will hold DemoSecret, and make sure this
+# script (running as you) has permission to write a secret into it.
 echo "==> Key Vault (RBAC mode) + a demo secret"
 # az keyvault create errors instead of no-op'ing if the vault already exists,
 # unlike most other `az ... create` commands here.
@@ -63,6 +78,11 @@ if [[ "$ROLE_JUST_CREATED" == "1" ]]; then
 fi
 az keyvault secret set --vault-name "$KV_NAME" -n DemoSecret --value "hello-from-key-vault" -o none
 
+# --- App Service only: skip this entire section if the app runs on-prem or ---
+# --- anywhere else that isn't Azure App Service. Managed identity (what     ---
+# --- this section grants) only exists for things Azure itself is running.  ---
+# Goal: stand up the web app that will read DemoSecret at runtime, using its
+# own managed identity -- an identity with no password or secret to leak.
 echo "==> App Service (Linux, .NET 10) with a system-assigned managed identity"
 # Azure periodically caps Free/Shared App Service capacity in high-demand
 # regions (eastus, westus2, ...) independent of the Key Vault's region, which
@@ -96,7 +116,10 @@ fi
 WEBAPP_PRINCIPAL=$(az webapp identity assign -n "$WEBAPP_NAME" -g "$RG" --query principalId -o tsv)
 ensure_role_assignment "$WEBAPP_PRINCIPAL" ServicePrincipal "Key Vault Secrets User" "$KV_ID"
 az webapp config appsettings set -n "$WEBAPP_NAME" -g "$RG" --settings "KeyVault__Uri=$KV_URI" -o none
+# --- end of the App Service-only section ---
 
+# Goal: create the identity GitHub Actions will log in as, and tell Azure
+# exactly which repo and branch it's allowed to log in from.
 echo "==> Entra app registration that GitHub Actions will sign in as (via OIDC, no secret)"
 CLIENT_ID=$(az ad app list --display-name "$ENTRA_APP_NAME" --query "[0].appId" -o tsv)
 if [[ -z "$CLIENT_ID" ]]; then
@@ -137,11 +160,17 @@ elif [[ "$EXISTING_SUBJECT" != "$SUBJECT" ]]; then
 fi
 rm /tmp/fic.json
 
-# What the pipeline may do: deploy to the web app, and read secrets from the vault.
+# Goal: let that GitHub identity actually do something once it's logged in --
+# deploy the app, and read the vault (used by the workflow's demo read step).
+# The "Website Contributor" grant is App Service only -- drop it (and
+# WEBAPP_ID) if deploying elsewhere; the Key Vault grant still applies if the
+# pipeline itself needs to read secrets during an on-prem deploy too.
 WEBAPP_ID=$(az webapp show -n "$WEBAPP_NAME" -g "$RG" --query id -o tsv)
 ensure_role_assignment "$SP_ID" ServicePrincipal "Website Contributor" "$WEBAPP_ID"
 ensure_role_assignment "$SP_ID" ServicePrincipal "Key Vault Secrets User" "$KV_ID"
 
+# Goal: hand back everything you need to wire up the GitHub side (as
+# repository variables, not secrets -- see README for why that's safe here).
 cat <<OUT
 
 Done. Add these as GitHub repository *variables* (Settings > Secrets and variables > Actions > Variables).
@@ -150,7 +179,7 @@ None of them are secrets -- that's the point of OIDC.
   AZURE_CLIENT_ID       = $CLIENT_ID
   AZURE_TENANT_ID       = $TENANT_ID
   AZURE_SUBSCRIPTION_ID = $SUBSCRIPTION_ID
-  AZURE_WEBAPP_NAME     = $WEBAPP_NAME
+  AZURE_WEBAPP_NAME     = $WEBAPP_NAME       # App Service only -- N/A if deploying on-prem
   AZURE_KEYVAULT_NAME   = $KV_NAME
 
 App URL: https://$(az webapp show -n "$WEBAPP_NAME" -g "$RG" --query defaultHostName -o tsv)
